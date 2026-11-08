@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#1b1430" />
+    <title>Daily Bottle Flip</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+
+    <div id="hud" class="hidden">
+      <div id="stage"><span class="tag">STAGE 01</span> KITCHEN COUNTER</div>
+      <div id="callout" class="hidden">
+        <div id="callout-main"></div>
+        <div id="callout-sub"></div>
+      </div>
+      <div id="prompt" class="hidden">
+        <div class="phone"><div class="phone-screen"></div></div>
+        <div id="prompt-text">HOLD TIGHT<br />SNAP YOUR WRIST UP</div>
+      </div>
+      <div id="meter"><div id="meter-fill"></div></div>
+      <div id="stats"></div>
+    </div>
+
+    <div id="stagecard" class="hidden">
+      <div class="sc-num">STAGE 01</div>
+      <div class="sc-name">KITCHEN COUNTER</div>
+      <div class="sc-sub">WARM-UP · HALF-FULL BOTTLE</div>
+    </div>
+
+    <div id="title" class="screen">
+      <div class="disc">
+        <div class="vol">PLAYABLE DEMO · VOL.1</div>
+        <h1><span>DAILY</span><span>BOTTLE</span><span>FLIP</span></h1>
+        <button id="start" class="blink">PRESS START</button>
+        <p class="hint">Phone in portrait. Hold it tight. Flick your wrist to flip the bottle.</p>
+      </div>
+      <div class="footer">© 2026 FLIPSOFT INTERACTIVE · PROTOTYPE DISC</div>
+    </div>
+
+    <div id="message" class="screen hidden">
+      <div class="disc">
+        <h2 id="message-title"></h2>
+        <p id="message-body"></p>
+        <button id="message-btn" class="hidden"></button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
