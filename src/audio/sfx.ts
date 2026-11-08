@@ -72,6 +72,9 @@ export const sfx = {
     tone(660, t, 0.06, 'square', 0.15);
     tone(990, t + 0.06, 0.08, 'square', 0.15);
   },
+  star(i: number) {
+    tone(880 * Math.pow(2, i / 12 * 2), now(), 0.09, 'triangle', 0.12);
+  },
   nice() {
     const t = now();
     [523, 659, 784, 1047].forEach((f, i) => tone(f, t + i * 0.07, 0.18, 'square', 0.16));

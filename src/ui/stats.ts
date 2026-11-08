@@ -10,7 +10,7 @@ export interface Stats {
 
 export interface FlickLogEntry {
   at: string;
-  source: 'sensor' | 'debug';
+  source: 'sensor' | 'debug' | 'remote';
   sample: Partial<FlickSample>;
   launch: MappedFlick;
   result: SimResult;

@@ -11,7 +11,7 @@ export const GEO = {
   innerR: 0.031,
   waterBottom: 0.003,
   waterTop: 0.14, // water slugs stay in the straight body
-  shellMass: 0.022,
+  shellMass: 0.018,
   shellCom: 0.105,
 } as const;
 
@@ -29,12 +29,19 @@ export interface Tuning {
   // flick -> launch mapping
   spinScale: number; // rad/s of bottle spin per rad/s of wrist spin
   launchBase: number; // m/s
-  launchScale: number; // m/s of upward speed per m/s^2 of peak accel
+  launchScale: number; // m/s of upward speed per m/s^2 of peak accel (before the soft cap)
+  liftMax: number; // m/s: the hand's lift levels off here however hard you flick
   minVy: number;
   maxVy: number;
   maxRot: number; // deg/s clamp on wrist spin
   assist: number; // 0..1 strength of the spin magnet (main difficulty dial)
   assistWidth: number; // fraction of ideal spin over which the magnet acts
+  swingGain: number; // held bottle: radians of swing per radian of phone pitch (sign = direction)
+  releaseAngle: number; // deg of phone pitch past rest at which the bottle lets go
+  releaseRate: number; // deg/s of phone pitch: let go at the peak of a swing faster than this
+  releaseSpin: number; // fraction of the swing's spin the bottle keeps when it lets go
+  releaseCarry: number; // fraction of the swing's linear speed the bottle keeps (less = height depends less on spin)
+  overshootForgive: number; // 0..1: how much a too-fast release (up to +40%) is softened
   launchVx: number; // m/s forward drift
   releaseX: number;
   releaseY: number; // base height above counter at release
@@ -46,21 +53,28 @@ export interface Tuning {
 
 export const DEFAULTS: Tuning = {
   gravity: 9.81,
-  fill: 0.5,
+  fill: 0.4,
   restitution: 0.1,
   friction: 0.55,
   waterDamping: 5,
   waterBounce: 0.05,
   slosh: 1,
   landingGrip: 45,
-  spinScale: 0.9,
+  spinScale: 1.4,
   launchBase: 0.9,
-  launchScale: 0.045,
+  launchScale: 0.042,
+  liftMax: 1.3,
   minVy: 0.6,
   maxVy: 4,
   maxRot: 2400,
-  assist: 0.3,
+  assist: 0.2,
   assistWidth: 0.3,
+  swingGain: 1.5,
+  releaseAngle: 65,
+  releaseRate: 400,
+  releaseSpin: 0.85,
+  releaseCarry: 0.5,
+  overshootForgive: 0.5,
   launchVx: 0.3,
   releaseX: -0.14,
   releaseY: 0.12,

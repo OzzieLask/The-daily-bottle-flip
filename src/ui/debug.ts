@@ -4,8 +4,8 @@
 //  - landing-window heatmap over flick space (wrist spin x peak accel)
 //  - raw flick log from real phones, copyable as JSON
 import { DEFAULTS, P, saveTuning, TUNING_KEY, type Tuning } from '../config';
-import { mapFlick } from '../input/flickMap';
-import { simulate, type Tier } from '../physics/bottleSim';
+import { heldAt, mapRelease, simulateRelease, swingSpin, targetRate } from '../input/flickMap';
+import type { Tier } from '../physics/bottleSim';
 import { clearLog, readLog } from './stats';
 
 type Range = [min: number, max: number, step: number];
@@ -13,9 +13,16 @@ const SLIDERS: Partial<Record<keyof Tuning, Range>> = {
   fill: [0.1, 0.9, 0.01],
   assist: [0, 0.95, 0.01],
   assistWidth: [0.05, 0.8, 0.01],
+  swingGain: [-3, 3, 0.1],
+  releaseAngle: [15, 120, 1],
+  releaseRate: [100, 1500, 10],
+  releaseSpin: [0.3, 1.2, 0.01],
+  releaseCarry: [0.1, 1, 0.05],
+  overshootForgive: [0, 0.9, 0.05],
   spinScale: [0.2, 1.2, 0.01],
   launchBase: [0, 2.5, 0.05],
-  launchScale: [0.01, 0.12, 0.001],
+  launchScale: [0.005, 0.08, 0.001],
+  liftMax: [0.1, 2.5, 0.05],
   launchVx: [0, 0.8, 0.01],
   landingGrip: [0, 120, 1],
   friction: [0.1, 1.2, 0.01],
@@ -33,7 +40,7 @@ const TIER_RGB: Record<Tier, [number, number, number]> = {
   MISS: [40, 34, 60],
 };
 
-const ROT_RANGE: [number, number] = [300, 2500];
+const ROT_RANGE: [number, number] = [150, 1600]; // phone pitch speed at release, deg/s
 const ACC_RANGE: [number, number] = [5, 60];
 
 export interface DebugHooks {
@@ -45,16 +52,20 @@ export function mountDebug(hooks: DebugHooks): { refreshLog(): void; markFlick(r
   root.id = 'debug';
   root.innerHTML = `
     <div class="dbg-head"><span>DEBUG · tuning</span><button data-act="toggle">hide</button></div>
-    <h4>Synthetic flick (Space)</h4>
-    <label>wrist deg/s<input type="range" id="d-rot" min="${ROT_RANGE[0]}" max="${ROT_RANGE[1]}" step="10" value="1300"><span id="d-rot-v"></span></label>
+    <h4>Synthetic release at releaseAngle (Space)</h4>
+    <label>pitch deg/s<input type="range" id="d-rot" min="${ROT_RANGE[0]}" max="${ROT_RANGE[1]}" step="5" value="680"><span id="d-rot-v"></span></label>
     <label>peak m/s²<input type="range" id="d-acc" min="${ACC_RANGE[0]}" max="${ACC_RANGE[1]}" step="0.5" value="35"><span id="d-acc-v"></span></label>
     <div id="d-preview" class="log"></div>
     <button data-act="fire">FIRE</button><button data-act="ideal">snap to ideal spin</button>
-    <h4>Landing window (rows: accel ↑, cols: wrist spin →)</h4>
-    <canvas id="d-map" width="88" height="44"></canvas>
+    <h4>Raw landing window, no assist (rows: power ↑, cols: pitch speed →)</h4>
+    <canvas id="d-map" width="44" height="22"></canvas>
     <div class="legend"><span style="color:#6ee7b7">■ clean</span><span style="color:#3a9bff">■ wobble</span><span style="color:#ffd23f">■ cap</span><span>■ miss</span></div>
     <div id="d-mapstat" class="log"></div>
     <button data-act="map">recompute map</button>
+    <h4>Overshooting? Fit to your flick</h4>
+    <div id="d-fit" class="log">Make 5+ real flicks, then fit: releaseSpin is set so your
+typical release speed lands on the target.</div>
+    <button data-act="fit">fit to my last 8 flicks</button>
     <h4>Tuning</h4>
     <div id="d-sliders"></div>
     <button data-act="reset">reset defaults</button><button data-act="copytune">copy tuning JSON</button>
@@ -75,7 +86,8 @@ export function mountDebug(hooks: DebugHooks): { refreshLog(): void; markFlick(r
   const preview = () => {
     $('#d-rot-v').textContent = rotIn.value;
     $('#d-acc-v').textContent = accIn.value;
-    const m = mapFlick({ rot: +rotIn.value, acc: +accIn.value });
+    const DEG = Math.PI / 180;
+    const m = mapRelease(heldAt(P.releaseAngle).heldSnapshot(), swingSpin(+rotIn.value * DEG), +accIn.value);
     $('#d-preview').textContent =
       `vy ${m.vy.toFixed(2)} m/s  ω ${m.omega.toFixed(1)} rad/s\n` +
       `ideal ω ${m.idealOmega.toFixed(1)}  spin err ${(m.spinError * 100).toFixed(0)}%`;
@@ -134,7 +146,7 @@ export function mountDebug(hooks: DebugHooks): { refreshLog(): void; markFlick(r
       const acc = ACC_RANGE[1] - ((ACC_RANGE[1] - ACC_RANGE[0]) * y) / (H - 1);
       for (let x = 0; x < W; x++) {
         const rot = ROT_RANGE[0] + ((ROT_RANGE[1] - ROT_RANGE[0]) * x) / (W - 1);
-        const tier = simulate(mapFlick({ rot, acc })).tier;
+        const tier = simulateRelease(rot, acc, false).result.tier;
         counts[tier]++;
         const [r, g, b] = TIER_RGB[tier];
         const i = (y * W + x) * 4;
@@ -202,8 +214,7 @@ export function mountDebug(hooks: DebugHooks): { refreshLog(): void; markFlick(r
         hooks.fire(+rotIn.value, +accIn.value);
         break;
       case 'ideal': {
-        const m = mapFlick({ rot: +rotIn.value, acc: +accIn.value });
-        rotIn.value = String(Math.round(-m.idealOmega / ((P.spinScale * Math.PI) / 180)));
+        rotIn.value = String(Math.round(targetRate(+accIn.value)));
         preview();
         break;
       }
@@ -221,6 +232,33 @@ export function mountDebug(hooks: DebugHooks): { refreshLog(): void; markFlick(r
         preview();
         computeMap();
         break;
+      case 'fit': {
+        // real releases only (phone or paired phone), most recent first
+        const real = readLog()
+          .filter((e) => e.source !== 'debug' && typeof e.sample.rate === 'number')
+          .slice(-8);
+        if (real.length < 3) {
+          $('#d-fit').textContent = `Only ${real.length} real flicks logged. Make a few more first.`;
+          break;
+        }
+        const med = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+        const rate = med(real.map((e) => Math.abs(e.sample.rate as number) / (Math.PI / 180)));
+        const acc = med(real.map((e) => e.sample.acc ?? 30));
+        const target = targetRate(acc);
+        const before = P.releaseSpin;
+        // target scales with 1/releaseSpin, so this puts your median on it
+        P.releaseSpin = Math.min(1.2, Math.max(0.3, +(before * (target / rate)).toFixed(3)));
+        saveTuning();
+        sliders.querySelectorAll('label').forEach((l) => (l as HTMLLabelElement & { sync?: () => void }).sync?.());
+        preview();
+        $('#d-fit').textContent =
+          `Your median release: ${Math.round(rate)}°/s at ${acc.toFixed(0)} m/s² (${real.length} flicks).
+` +
+          `Target was ${Math.round(target)}°/s → now ${Math.round(targetRate(acc))}°/s.
+` +
+          `releaseSpin ${before} → ${P.releaseSpin}. Copy tuning JSON to keep it.`;
+        break;
+      }
       case 'copytune':
         void copy(JSON.stringify(P, null, 2));
         break;

@@ -14,7 +14,8 @@
 //
 // Units are SI. theta is counter-clockwise; a flip spins clockwise (omega < 0).
 
-import { FLOOR_Y, GEO, P } from '../config';
+import { GEO, P } from '../config';
+import { colliders, type Collider } from './world';
 
 export type Tier = 'CAP' | 'CLEAN' | 'WOBBLE' | 'MISS';
 export type MissReason = 'side' | 'fell' | 'noflip' | null;
@@ -30,6 +31,21 @@ export interface SimResult {
   reason: MissReason;
   rotations: number;
   maxTiltDeg: number;
+  /** What it came to rest on: 'island', 'back counter', 'floor'... */
+  surface: string;
+  /** Obstacles it bounced off before landing (lamp, wall). */
+  hits: string[];
+  bounced: boolean;
+}
+
+/** Everything needed to recreate a held bottle (for predicting a release). */
+export interface HeldSnapshot {
+  theta: number;
+  px: number;
+  py: number;
+  s: number[];
+  v: number[];
+  fill: number;
 }
 
 export interface ImpactEvent {
@@ -49,6 +65,23 @@ const HULL: ReadonlyArray<readonly [number, number]> = [
   [GEO.capR, GEO.H],
 ];
 
+/** The same hull as a counter-clockwise polygon, for box corners poking into the bottle. */
+const POLY: ReadonlyArray<readonly [number, number]> = [
+  [-GEO.baseR, 0],
+  [GEO.baseR, 0],
+  [GEO.R, 0.008],
+  [GEO.R, GEO.shoulder],
+  [GEO.capR, GEO.H],
+  [-GEO.capR, GEO.H],
+  [-GEO.R, GEO.shoulder],
+  [-GEO.R, 0.008],
+];
+const POLY_N = POLY.map(([ax, ay], i) => {
+  const [bx, by] = POLY[(i + 1) % POLY.length];
+  const len = Math.hypot(bx - ax, by - ay);
+  return [(by - ay) / len, -(bx - ax) / len] as const; // outward normal
+});
+
 const SPECULATIVE = 0.012;
 const ITERATIONS = 20;
 const TAU = Math.PI * 2;
@@ -58,13 +91,15 @@ export function wrapAngle(a: number): number {
 }
 
 interface Contact {
-  rx: number;
+  rx: number; // contact point relative to the shell COM
   ry: number;
-  gap: number;
+  nx: number; // normal: the direction the bottle is pushed
+  ny: number;
+  gap: number; // >0 apart (speculative), <0 overlapping
   vn0: number;
   ln: number;
   lt: number;
-  floor: boolean;
+  c: Collider;
 }
 
 interface Slug {
@@ -105,6 +140,17 @@ export class BottleSim {
   lowestGap = 1; // min height of the hull above the counter top
   events: ImpactEvent[] = [];
 
+  /** Test mode: the cap is pinned to the hand and the bottle is driven by the phone. */
+  held = false;
+  private heldS: [number, number] = [0, 0];
+  private heldV: [number, number] = [0, 0];
+  private heldPrev = 0;
+  private pivotX = 0;
+  private pivotY = 0;
+
+  private world: Collider[] = colliders();
+  private restOn = '';
+  private hits: string[] = [];
   private airAfterTouch = 0;
   private restTime = 0;
   private wasInContact = false;
@@ -136,6 +182,10 @@ export class BottleSim {
     this.placeSlug(0, this.lo);
     this.placeSlug(1, this.lo + this.q);
 
+    this.held = false;
+    this.world = colliders();
+    this.restOn = '';
+    this.hits = [];
     this.t = 0;
     this.launched = false;
     this.done = false;
@@ -179,8 +229,115 @@ export class BottleSim {
     return [this.x + Math.sin(this.theta) * GEO.shellCom, this.y - Math.cos(this.theta) * GEO.shellCom];
   }
 
+  /**
+   * Test mode: hang the bottle from its cap at (px, py) and swing it to angle
+   * `theta` (0 = hanging straight down from the hand). Nothing is released;
+   * only the water moves, pushed by gravity and the swing's centrifugal pull,
+   * so a flick visibly slams it into the base like a real one.
+   */
+  hold(dt: number, theta: number, px: number, py: number): void {
+    if (!this.held) {
+      this.held = true;
+      this.heldS = [this.lo, this.lo + this.q];
+      this.heldV = [0, 0];
+      this.heldPrev = theta;
+    }
+    const omega = dt > 0 ? (theta - this.heldPrev) / dt : 0;
+    this.heldPrev = theta;
+    this.theta = theta;
+    this.omega = omega;
+    this.pivotX = px;
+    this.pivotY = py;
+    // place the shell so the cap top sits at the pivot
+    const sn = Math.sin(theta);
+    const cs = Math.cos(theta);
+    const ox = px + sn * GEO.H;
+    const oy = py - cs * GEO.H;
+    this.x = ox - sn * GEO.shellCom;
+    this.y = oy + cs * GEO.shellCom;
+    this.vx = this.vy = 0;
+
+    // water along the axis, in the frame rotating about the cap (s = H)
+    const s = this.heldS;
+    const v = this.heldV;
+    for (let i = 0; i < 2; i++) {
+      const acc = omega * omega * (s[i] - GEO.H) - P.gravity * cs - P.waterDamping * v[i];
+      v[i] += acc * dt;
+      s[i] += v[i] * dt;
+    }
+    const { lo, hi, q } = this;
+    if (s[0] < lo) {
+      s[0] = lo;
+      if (v[0] < 0) v[0] = -v[0] * P.waterBounce;
+    }
+    if (s[1] > hi) {
+      s[1] = hi;
+      if (v[1] > 0) v[1] = -v[1] * P.waterBounce;
+    }
+    if (s[1] - s[0] < q) {
+      const mid = Math.min(hi - q / 2, Math.max(lo + q / 2, (s[0] + s[1]) / 2));
+      s[0] = mid - q / 2;
+      s[1] = mid + q / 2;
+      const vm = (v[0] + v[1]) / 2;
+      v[0] = v[1] = vm;
+    }
+  }
+
+  heldSnapshot(): HeldSnapshot {
+    return {
+      theta: this.theta,
+      px: this.pivotX,
+      py: this.pivotY,
+      s: [...this.heldS],
+      v: [...this.heldV],
+      fill: P.fill,
+    };
+  }
+
+  static fromHeld(snap: HeldSnapshot): BottleSim {
+    const sim = new BottleSim();
+    sim.reset(snap.fill);
+    sim.hold(0, snap.theta, snap.px, snap.py);
+    sim.heldS = [snap.s[0], snap.s[1]];
+    sim.heldV = [snap.v[0], snap.v[1]];
+    return sim;
+  }
+
+  /**
+   * Let go. The bottle leaves the hand spinning at `omega` about the cap, so
+   * every part keeps the velocity the swing gave it, plus the hand's lift.
+   */
+  release(omega: number, liftX: number, liftY: number): void {
+    if (!this.held) return;
+    const sn = Math.sin(this.theta);
+    const cs = Math.cos(this.theta);
+    const ux = -sn;
+    const uy = cs;
+    const [ox, oy] = this.origin();
+    const px = this.pivotX;
+    const py = this.pivotY;
+    // the swing's speed about the hand, partly carried over (releaseCarry), plus the hand's lift
+    const k = P.releaseCarry;
+    const swing = (b: { x: number; y: number; vx: number; vy: number }) => {
+      b.vx = -omega * (b.y - py) * k + liftX;
+      b.vy = omega * (b.x - px) * k + liftY;
+    };
+    swing(this);
+    this.slugs.forEach((g, i) => {
+      g.x = ox + ux * this.heldS[i];
+      g.y = oy + uy * this.heldS[i];
+      swing(g);
+      g.vx += ux * this.heldV[i];
+      g.vy += uy * this.heldV[i];
+    });
+    this.omega = omega;
+    this.held = false;
+    this.launched = true;
+  }
+
   /** Axial position of slug i, measured from the base. */
   slugS(i: number): number {
+    if (this.held) return this.heldS[i];
     const [ox, oy] = this.origin();
     const g = this.slugs[i];
     return -(g.x - ox) * Math.sin(this.theta) + (g.y - oy) * Math.cos(this.theta);
@@ -234,16 +391,71 @@ export class BottleSim {
     const contacts = this.contacts;
     contacts.length = 0;
     let lowest = 1;
-    for (const [bx, by] of HULL) {
-      const wx = ox + bx * cs - by * sn;
-      const wy = oy + bx * sn + by * cs;
-      const overCounter = wx >= P.counterMinX && wx <= P.counterMaxX && wy > -0.06;
-      const gap = wy - (overCounter ? 0 : FLOOR_Y);
-      if (overCounter) lowest = Math.min(lowest, gap);
-      if (gap < SPECULATIVE) {
-        const rx = wx - this.x;
-        const ry = wy - this.y;
-        contacts.push({ rx, ry, gap, vn0: this.vy + this.omega * rx, ln: 0, lt: 0, floor: !overCounter });
+    const add = (wx: number, wy: number, nx: number, ny: number, gap: number, c: Collider) => {
+      const rx = wx - this.x;
+      const ry = wy - this.y;
+      const vn0 = (this.vx - this.omega * ry) * nx + (this.vy + this.omega * rx) * ny;
+      contacts.push({ rx, ry, nx, ny, gap, vn0, ln: 0, lt: 0, c });
+    };
+    const reach = GEO.H + SPECULATIVE; // bottle fits in a circle this big around its base
+
+    for (const c of this.world) {
+      if (ox < c.minX - reach || ox > c.maxX + reach || oy < c.minY - reach || oy > c.maxY + reach) continue;
+
+      // bottle corners against the box
+      for (const [bx, by] of HULL) {
+        const wx = ox + bx * cs - by * sn;
+        const wy = oy + bx * sn + by * cs;
+        if (c.kind === 'land' && wx >= c.minX && wx <= c.maxX && wy > c.maxY - 0.06) {
+          lowest = Math.min(lowest, wy - c.maxY);
+        }
+        const dx = wx < c.minX ? c.minX - wx : wx > c.maxX ? wx - c.maxX : 0;
+        const dy = wy < c.minY ? c.minY - wy : wy > c.maxY ? wy - c.maxY : 0;
+        if (dx === 0 && dy === 0) {
+          // inside: push out through the nearest face
+          const faces = [wy - c.minY, c.maxY - wy, wx - c.minX, c.maxX - wx];
+          const i = faces.indexOf(Math.min(...faces));
+          const n = [
+            [0, -1],
+            [0, 1],
+            [-1, 0],
+            [1, 0],
+          ][i];
+          add(wx, wy, n[0], n[1], -faces[i], c);
+        } else {
+          const gap = Math.hypot(dx, dy);
+          if (gap < SPECULATIVE) {
+            const nx = dx === 0 ? 0 : wx < c.minX ? -dx / gap : dx / gap;
+            const ny = dy === 0 ? 0 : wy < c.minY ? -dy / gap : dy / gap;
+            add(wx, wy, nx, ny, gap, c);
+          }
+        }
+      }
+
+      // box corners poking into the bottle (catching an edge)
+      for (const [kx, ky] of [
+        [c.minX, c.maxY],
+        [c.maxX, c.maxY],
+        [c.minX, c.minY],
+        [c.maxX, c.minY],
+      ]) {
+        // corner in body space
+        const qx = (kx - ox) * cs + (ky - oy) * sn;
+        const qy = -(kx - ox) * sn + (ky - oy) * cs;
+        let best = -Infinity;
+        let bi = 0;
+        for (let i = 0; i < POLY.length; i++) {
+          const d = (qx - POLY[i][0]) * POLY_N[i][0] + (qy - POLY[i][1]) * POLY_N[i][1];
+          if (d > best) {
+            best = d;
+            bi = i;
+          }
+        }
+        if (best < SPECULATIVE) {
+          // push the bottle away from the corner, against that edge's normal
+          const [enx, eny] = POLY_N[bi];
+          add(kx, ky, -(enx * cs - eny * sn), -(enx * sn + eny * cs), best, c);
+        }
       }
     }
     this.lowestGap = lowest;
@@ -299,28 +511,39 @@ export class BottleSim {
     for (let it = 0; it < ITERATIONS; it++) {
       // --- shell vs world contacts ---
       for (const ct of this.contacts) {
-        const vn = this.vy + this.omega * ct.rx;
+        const { rx, ry, nx, ny } = ct;
+        const tx = -ny; // tangent
+        const ty = nx;
+        const pvx = this.vx - this.omega * ry; // shell velocity at the contact point
+        const pvy = this.vy + this.omega * rx;
+        const vn = pvx * nx + pvy * ny;
         let target: number;
         if (ct.gap > 0) target = -ct.gap / dt;
         else {
           const bounce = ct.vn0 < -0.4 ? -P.restitution * ct.vn0 : 0;
           target = Math.max(bounce, Math.min((-ct.gap * 0.2) / dt, 0.3));
         }
-        const kn = invMs + ct.rx * ct.rx * invIs;
+        const rn = rx * ny - ry * nx;
+        const kn = invMs + rn * rn * invIs;
         const ln = Math.max(0, ct.ln + (target - vn) / kn);
         const dn = ln - ct.ln;
         ct.ln = ln;
-        this.vy += dn * invMs;
-        this.omega += ct.rx * dn * invIs;
+        this.vx += nx * dn * invMs;
+        this.vy += ny * dn * invMs;
+        this.omega += rn * dn * invIs;
 
-        const vt = this.vx - this.omega * ct.ry;
-        const kt = invMs + ct.ry * ct.ry * invIs;
+        const qvx = this.vx - this.omega * ry;
+        const qvy = this.vy + this.omega * rx;
+        const vt = qvx * tx + qvy * ty;
+        const rt = rx * ty - ry * tx;
+        const kt = invMs + rt * rt * invIs;
         const maxF = P.friction * ct.ln;
         const lt = Math.max(-maxF, Math.min(maxF, ct.lt - vt / kt));
         const dl = lt - ct.lt;
         ct.lt = lt;
-        this.vx += dl * invMs;
-        this.omega -= ct.ry * dl * invIs;
+        this.vx += tx * dl * invMs;
+        this.vy += ty * dl * invMs;
+        this.omega += rt * dl * invIs;
       }
 
       // --- slider joint: slugs stay on the axis ---
@@ -367,21 +590,29 @@ export class BottleSim {
     let impact = 0;
     let impactFloor = false;
     let touching = false;
+    let onTop = false;
     for (const ct of this.contacts) {
       if (ct.ln > 1e-7) {
         touching = true;
-        if (!ct.floor) this.touched = true;
+        const top = ct.c.kind === 'land' && ct.ny > 0.7; // standing on a counter top
+        if (top) {
+          this.touched = true;
+          onTop = true;
+          this.restOn = ct.c.name;
+        } else if (ct.c.kind === 'floor') this.restOn = 'floor';
+        else if (ct.c.kind === 'obstacle') {
+          // the lamp or the wall: a trick-shot bounce if it happens mid-air
+          if (!this.touched && !this.hits.includes(ct.c.name)) this.hits.push(ct.c.name);
+        }
         if (-ct.vn0 > impact) {
           impact = -ct.vn0;
-          impactFloor = ct.floor;
+          impactFloor = ct.c.kind === 'floor';
         }
       }
     }
     // Landing grip: stands in for sideways water slosh and the soft base, which
     // soak up spin on touchdown but aren't modelled directly.
-    if (this.contacts.some((ct) => !ct.floor && ct.ln > 1e-7)) {
-      this.omega *= Math.exp(-P.landingGrip * dt);
-    }
+    if (onTop) this.omega *= Math.exp(-P.landingGrip * dt);
     if (touching && !this.wasInContact && impact > 0.15) this.events.push({ speed: impact, floor: impactFloor });
     this.wasInContact = touching;
   }
@@ -406,9 +637,15 @@ export class BottleSim {
     this.done = true;
     const a = wrapAngle(this.theta);
     const turns = Math.abs(this.theta) / TAU;
-    const onCounter = this.y > -0.1;
+    const onCounter = this.restOn !== 'floor' && this.restOn !== '' && this.y > -0.5;
     const maxTiltDeg = (this.maxTilt * 180) / Math.PI;
-    const base = { rotations: turns, maxTiltDeg };
+    const base = {
+      rotations: turns,
+      maxTiltDeg,
+      surface: onCounter ? this.restOn : 'floor',
+      hits: [...this.hits],
+      bounced: this.bounced,
+    };
 
     if (!onCounter) this.result = { tier: 'MISS', reason: 'fell', ...base };
     else if (Math.abs(a) < 0.35) {
@@ -433,7 +670,7 @@ export function idealOmega(vx: number, vy: number, turns = 1): number {
   const contactAngle = (omega: number): number => {
     const sim = new BottleSim();
     sim.launch({ vx, vy, omega });
-    while (!sim.touched && sim.t < 3) sim.step(1 / 240);
+    while (!sim.touched && !sim.done && sim.t < 3) sim.step(1 / 240);
     return sim.theta;
   };
   let lo = -2; // too little spin: theta > -2pi*turns
@@ -444,6 +681,38 @@ export function idealOmega(vx: number, vy: number, turns = 1): number {
     else hi = mid;
   }
   return (lo + hi) / 2;
+}
+
+/**
+ * The release spin (signed like `dir`) that makes the bottle touch the counter
+ * upright after one full turn from hanging, for a given held pose and lift.
+ */
+export function idealReleaseOmega(snap: HeldSnapshot, liftX: number, liftY: number, dir: number): number {
+  const contactAngle = (w: number): number => {
+    const sim = BottleSim.fromHeld(snap);
+    sim.release(dir * w, liftX, liftY);
+    while (!sim.touched && !sim.done && sim.t < 3) sim.step(1 / 240);
+    return sim.theta * dir;
+  };
+  // Big spins can hit the lamp or reach the back counter, so contact angle
+  // isn't monotonic over the whole range: scan up from slow spins for the
+  // first bracket that completes a turn, then bisect inside it.
+  let lo = 1;
+  let hi = 0;
+  for (let w = 2; w <= 40; w += 1.5) {
+    if (contactAngle(w) >= TAU) {
+      hi = w;
+      break;
+    }
+    lo = w;
+  }
+  if (hi === 0) return dir * 40;
+  for (let i = 0; i < 12; i++) {
+    const mid = (lo + hi) / 2;
+    if (contactAngle(mid) < TAU) lo = mid;
+    else hi = mid;
+  }
+  return (dir * (lo + hi)) / 2;
 }
 
 /** Run a launch to completion without rendering (sweep script and debug map). */
